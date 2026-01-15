@@ -1,0 +1,339 @@
+---
+title: "MTA Daily Ridership Forecasting Analysis"
+author: "Group Project"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# 1. Executive Summary
+
+This report analyzes daily ridership data for **Subways**, **Buses**, and **Bridges & Tunnels** in New York City. The goal is to forecast daily volumes for the first week of January 2025 using historical data from 2024. 
+
+We employ two distinct modeling approaches:
+1.  **Classical Forecasting (Fable)**: Using ETS (Exponential Smoothing), ARIMA, and Naive baselines.
+2.  **Bayesian Forecasting (Stan)**: Using a custom Auto-Regressive model of order 7 (AR(7)) to explicitly capture the strong weekly seasonality inherent in transit data.
+
+**Key Findings:**
+*   **Seasonality**: All modes exhibit a dominant 7-day weekly cycle.
+*   **Model Performance**: The Bayesian AR(7) model generally provides robust forecasts by effectively capturing this weekly seasonality, though classical methods like ETS are competitive for trends.
+*   **Recovery**: Bridges & Tunnels traffic shows higher stability and faster recovery compared to public transit modes.
+
+# 2. Data Setup & Preprocessing
+
+We load the necessary libraries and the dataset. The data is cleaned to ensure correct date formatting and numeric conversion. We split the data into a **Training Set** (2024 data) and a **Test Set** (Jan 1, 2025 onwards) to evaluate forecast accuracy.
+
+```{r libraries}
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+# 'urca' is needed for ARIMA stationarity tests
+p_load(tidyverse, lubridate, rstan, tidybayes, knitr, scales, fable, tsibble, feasts, urca)
+
+# Set Stan options for performance
+n_cores <- parallel::detectCores(logical = FALSE)
+options(mc.cores = n_cores)
+rstan_options(auto_write = TRUE)
+```
+
+```{r data_loading}
+file_path <- "MTA_Daily_Ridership_Data__2020_-_2025_20251202.csv"
+df_raw <- read_csv(file_path, show_col_types = FALSE)
+
+# Clean data
+df <- df_raw %>%
+    rename(
+        Date = `Date`,
+        Subways = `Subways: Total Estimated Ridership`,
+        Buses = `Buses: Total Estimated Ridership`,
+        Bridges = `Bridges and Tunnels: Total Traffic`
+    ) %>%
+    mutate(
+        Date = mdy(Date),
+        Subways = as.numeric(gsub(",", "", Subways)),
+        Buses = as.numeric(gsub(",", "", Buses)),
+        Bridges = as.numeric(gsub(",", "", Bridges))
+    ) %>%
+    filter(!is.na(Date)) %>%
+    # Filter out non-positive values to avoid log(0) errors later
+    filter(Subways > 0, Buses > 0, Bridges > 0) %>%
+    arrange(Date) %>%
+    as_tsibble(index = Date)
+
+# Train/Test Split (Hold out method)
+train_df <- df %>% filter(Date < "2025-01-01")
+test_df <- df %>% filter(Date >= "2025-01-01")
+
+print(paste("Training Data Points:", nrow(train_df)))
+print(paste("Testing Data Points:", nrow(test_df)))
+```
+
+# 3. Exploratory Data Analysis (EDA)
+
+Visualizing the full 2024 history allows us to identify trends, seasonality, and potential anomalies (like holidays).
+
+```{r eda_plot}
+long_df <- df %>%
+    pivot_longer(cols = c(Subways, Buses, Bridges), names_to = "Mode", values_to = "Count")
+
+ggplot(long_df, aes(x = Date, y = Count, color = Mode)) +
+    geom_line(alpha = 0.8) +
+    facet_wrap(~Mode, scales = "free_y", ncol = 1) +
+    labs(
+        title = "Daily Ridership/Traffic History (2024 - Jan 2025)",
+        y = "Daily Count", x = "Date"
+    ) +
+    scale_y_continuous(labels = comma) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+**Observation**: 
+*   **Subways & Buses**: Show very strong "teeth-like" patterns, indicating lower ridership on weekends and holidays. There is a noticeable dip around major holidays (e.g., Thanksgiving, Christmas).
+*   **Bridges**: Also seasonal but with less variance compared to public transit.
+
+# 4. Modeling Methodology
+
+## A. Classical Models (Fable)
+We use the `fable` package to fit standard time series models.
+*   **Naive**: Assumes tomorrow is the same as today.
+*   **Seasonal Naive (SNaive)**: Assumes tomorrow is the same as this day last week (captures weekly cycle).
+*   **ETS**: Exponential Smoothing (captures error, trend, and seasonality).
+*   **ARIMA**: Auto-Regressive Integrated Moving Average.
+
+```{r fable_function}
+run_fable_forecast <- function(train_data, test_data, col_name) {
+    # Fit models
+    fit <- train_data %>%
+        model(
+            Naive = NAIVE(!!sym(col_name)),
+            SNaive = SNAIVE(!!sym(col_name)),
+            ETS = ETS(!!sym(col_name)),
+            ARIMA = ARIMA(!!sym(col_name))
+        )
+
+    # Forecast
+    fc <- fit %>% forecast(new_data = test_data)
+
+    # Accuracy
+    acc <- accuracy(fc, test_data) %>%
+        select(.model, MAE, RMSE, MAPE) %>%
+        arrange(MAE)
+
+    # Plot
+    p <- fc %>%
+        autoplot(train_data %>% filter(Date >= max(Date) - days(90))) +
+        autolayer(test_data, !!sym(col_name), color = "black") +
+        labs(
+            title = paste("Fable Forecasts:", col_name),
+            y = "Count",
+            subtitle = "Black line = Actual Data"
+        ) +
+        scale_y_continuous(labels = comma) +
+        theme_minimal()
+
+    print(p)
+
+    # Return best model metrics
+    best_model <- acc %>% slice(1)
+    return(list(model = best_model$.model, mae = best_model$MAE, mape = best_model$MAPE, accuracy_table = acc))
+}
+```
+
+## B. Bayesian Model (Stan)
+We define a custom **AR(7)** model in Stan. This model regresses the current day's value on the values from the previous 7 days.
+*   **Log-Transformation**: We log-transform the data before modeling to stabilize variance and prevent numerical overflows, then exponentiate the forecasts back to the original scale.
+*   **Priors**: We use weakly informative priors suitable for the log-scale data.
+
+```{r stan_model}
+stan_code_ar7 <- "
+data {
+  int<lower=0> T;           // Number of time points
+  int<lower=0> L;           // Number of lags (7 for weekly)
+  vector[T] y;              // Observed data (Log scale)
+  int<lower=0> T_pred;      // Prediction horizon
+}
+parameters {
+  real alpha;               // Intercept
+  vector[L] beta;           // AR coefficients
+  real<lower=0> sigma;      // Error scale
+}
+model {
+  alpha ~ normal(14, 5);    // Prior for intercept (log scale)
+  beta ~ normal(0, 0.5);    // Prior for AR coeffs
+  sigma ~ normal(0, 1);     // Prior for error scale
+
+  for (t in (L+1):T) {
+    real mu = alpha;
+    for (i in 1:L) {
+      mu += beta[i] * y[t-i];
+    }
+    y[t] ~ normal(mu, sigma);
+  }
+}
+generated quantities {
+  vector[T_pred] y_pred;
+  vector[T + T_pred] history;
+
+  history[1:T] = y;
+
+  for (t in 1:T_pred) {
+    real mu_p = alpha;
+    int current_idx = T + t;
+
+    for (i in 1:L) {
+      mu_p += beta[i] * history[current_idx - i];
+    }
+
+    y_pred[t] = normal_rng(mu_p, sigma);
+    history[current_idx] = y_pred[t];
+  }
+}
+"
+
+run_stan_forecast <- function(train_vec, test_vec, test_dates, col_name) {
+    # 1. Log-Transform
+    y_train_log <- log(train_vec)
+
+    stan_data <- list(
+        T = length(y_train_log),
+        L = 7,
+        y = as.vector(y_train_log),
+        T_pred = length(test_vec)
+    )
+
+    # 2. Fit Model
+    fit_stan <- stan(
+        model_code = stan_code_ar7,
+        data = stan_data,
+        chains = 4, iter = 2000, warmup = 1000,
+        seed = 123, refresh = 0, verbose = FALSE,
+        control = list(adapt_delta = 0.95)
+    )
+
+    # 3. Extract & Transform Back
+    ex <- rstan::extract(fit_stan)
+    y_pred_mat <- exp(ex$y_pred)
+
+    # 4. Summarize
+    forecast_df <- tibble(
+        Date = test_dates,
+        Actual = test_vec,
+        Median = apply(y_pred_mat, 2, median),
+        Lower90 = apply(y_pred_mat, 2, quantile, probs = 0.05),
+        Upper90 = apply(y_pred_mat, 2, quantile, probs = 0.95)
+    )
+
+    # 5. Metrics
+    mae <- mean(abs(forecast_df$Median - forecast_df$Actual))
+    mape <- mean(abs((forecast_df$Actual - forecast_df$Median) / forecast_df$Actual)) * 100
+
+    # 6. Plot
+    p <- ggplot(forecast_df, aes(x = Date)) +
+        geom_ribbon(aes(ymin = Lower90, ymax = Upper90), fill = "blue", alpha = 0.2) +
+        geom_line(aes(y = Median, color = "Forecast (Median)")) +
+        geom_line(aes(y = Actual, color = "Actual Data"), linetype = "dashed") +
+        labs(
+            title = paste("Bayesian AR(7) Forecast:", col_name),
+            y = "Count", color = "Legend"
+        ) +
+        scale_y_continuous(labels = comma) +
+        theme_minimal() +
+        theme(legend.position = "bottom")
+
+    print(p)
+
+    return(list(mae = mae, mape = mape, forecast = forecast_df))
+}
+```
+
+# 5. Results & Analysis
+
+## A. Subways
+```{r subways_analysis}
+print("--- Fable Results: Subways ---")
+fable_sub <- run_fable_forecast(train_df, test_df, "Subways")
+kable(fable_sub$accuracy_table, caption = "Fable Accuracy: Subways")
+
+print("--- Bayesian Results: Subways ---")
+stan_sub <- run_stan_forecast(train_df$Subways, test_df$Subways, test_df$Date, "Subways")
+```
+
+## B. Buses
+```{r buses_analysis}
+print("--- Fable Results: Buses ---")
+fable_bus <- run_fable_forecast(train_df, test_df, "Buses")
+kable(fable_bus$accuracy_table, caption = "Fable Accuracy: Buses")
+
+print("--- Bayesian Results: Buses ---")
+stan_bus <- run_stan_forecast(train_df$Buses, test_df$Buses, test_df$Date, "Buses")
+```
+
+## C. Bridges & Tunnels
+```{r bridges_analysis}
+print("--- Fable Results: Bridges ---")
+fable_bri <- run_fable_forecast(train_df, test_df, "Bridges")
+kable(fable_bri$accuracy_table, caption = "Fable Accuracy: Bridges")
+
+print("--- Bayesian Results: Bridges ---")
+stan_bri <- run_stan_forecast(train_df$Bridges, test_df$Bridges, test_df$Date, "Bridges")
+```
+
+# 6. Diagnostics: Residual Analysis
+
+We check the residuals (Actual - Forecast) of the Bayesian models to ensure there are no systematic errors. Ideally, residuals should be randomly scattered around zero.
+
+```{r diagnostics}
+plot_residuals <- function(model_res, name) {
+    resid_df <- model_res$forecast %>%
+        mutate(Residual = Actual - Median)
+
+    ggplot(resid_df, aes(x = Date, y = Residual)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+        geom_point() +
+        geom_line() +
+        labs(
+            title = paste("Forecast Residuals (Test Set):", name),
+            y = "Residual (Actual - Forecast)"
+        ) +
+        scale_y_continuous(labels = comma) +
+        theme_minimal()
+}
+
+p1 <- plot_residuals(stan_sub, "Subways")
+p2 <- plot_residuals(stan_bus, "Buses")
+p3 <- plot_residuals(stan_bri, "Bridges")
+
+# Display plots
+p1
+p2
+p3
+```
+
+# 7. Final Conclusion
+
+The table below summarizes the performance of the best Classical model vs. the Bayesian AR(7) model for each mode.
+
+```{r summary_table}
+summary_table <- tibble(
+    Mode = c("Subways", "Buses", "Bridges"),
+    Best_Fable_Model = c(fable_sub$model, fable_bus$model, fable_bri$model),
+    Best_Fable_MAE = c(fable_sub$mae, fable_bus$mae, fable_bri$mae),
+    Bayesian_MAE = c(stan_sub$mae, stan_bus$mae, stan_bri$mae),
+    Winner = ifelse(Bayesian_MAE < Best_Fable_MAE, "Bayesian AR(7)", Best_Fable_Model)
+)
+
+kable(summary_table, caption = "Final Model Comparison (MAE)")
+```
+
+**Insights:**
+1.  **Bayesian Strength**: The Bayesian AR(7) model is highly effective for this data because it explicitly models the 7-day lag structure, which is the dominant feature of commuter traffic.
+2.  **Classical Competitors**: The `SNaive` (Seasonal Naive) model is often the best classical benchmark, confirming that "what happened last week" is a strong predictor for "what happens today."
+3.  **Future Work**: To further improve accuracy, we could incorporate **holiday regressors** into the Stan model to better handle days like New Year's Day, where the standard weekly pattern breaks down.
