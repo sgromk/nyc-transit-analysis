@@ -1,4 +1,5 @@
 # MTA Ridership Forecasting: A Tournament of Models
+### Team Members: Rizvee Ahmed, Brendan Hendricks, Gabriel Kinshuk, Vyshnavi Maringanti
 
 This repository contains the analytical framework and implementation code used to forecast daily ridership across the Metropolitan Transportation Authority (MTA) network. The project addresses the operational challenges of the post-pandemic fiscal cliff, where projected operating deficits are expected to reach $400 million by 2027.
 
